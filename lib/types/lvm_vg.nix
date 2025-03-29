@@ -72,6 +72,38 @@ in
                 default = null; # maybe there is always a default type?
                 description = "LVM type";
               };
+              caching = lib.mkOption {
+                type = lib.types.nullOr (lib.types.submodule {
+                  options = {
+                    pv_drives = lib.mkOption {
+                      type = lib.types.listOf lib.types.str;
+                      description = "List of PVs to use for this LV (non-cache drives)";
+                    };
+                    cache_drive = lib.mkOption {
+                      type = lib.types.str;
+                      description = "Name of the PV to use for caching";
+                    };
+                    cache_size = lib.mkOption {
+                      type = lib.types.str;
+                      description = "Size of the cache";
+                    };
+                    cache_meta_drive = lib.mkOption {
+                      type = lib.types.str;
+                      description = "Name of the PV to use for caching metadata";
+                    };
+                    cache_meta_size = lib.mkOption {
+                      type = lib.types.str;
+                      description = "Size of the cache metadata. Recommended ratio 1000:1 compared to cache size. (minimum 8M)";
+                    };
+                  };
+                });
+                default = null;
+                description = ''
+                Configure LVM caching for this LV, requires explicit declaration of PVs used.
+                Define which PV (in the same VG) to be designated as cache drive for this LV.
+                See: https://docs.redhat.com/en/documentation/red_hat_enterprise_linux/6/html/logical_volume_manager_administration/lvm_cache_volume_creation
+                '';
+              };
               extraArgs = lib.mkOption {
                 type = lib.types.listOf lib.types.str;
                 default = [ ];
@@ -138,8 +170,50 @@ in
                 ${lib.optionalString (lv.lvm_type == "thinlv") "--thinpool=${lv.pool}"} \
                 ${lib.optionalString (lv.lvm_type != null && lv.lvm_type != "thinlv") "--type=${lv.lvm_type}"} \
                 ${toString lv.extraArgs} \
-                "${config.name}"
+                "${config.name}" \
+                ${lib.optionalString (lv.caching != null) "${builtins.concatStringsSep " " lv.caching.pv_drives}"}
             fi
+
+            ${lib.optionalString (lv.caching != null) (
+              ''
+                lvcreate \
+                  --yes \
+                  ${
+                    if (lib.hasInfix "%" lv.caching.cache_size) then
+                      "-l"
+                    else
+                      "-L"
+                  } \
+                    ${if lib.hasSuffix "%" lv.caching.cache_size then "${lv.caching.cache_size}FREE" else lv.caching.cache_size} \
+                  -n "${lv.name}_cache" \
+                  "${config.name}" \
+                  ${lv.caching.cache_drive}
+
+                lvcreate \
+                  --yes \
+                  ${
+                    if (lib.hasInfix "%" lv.caching.cache_meta_size) then
+                      "-l"
+                    else
+                      "-L"
+                  } \
+                    ${if lib.hasSuffix "%" lv.caching.cache_meta_size then "${lv.caching.cache_meta_size}FREE" else lv.caching.cache_meta_size} \
+                  -n "${lv.name}_cache_meta" \
+                  "${config.name}" \
+                  ${lv.caching.cache_meta_drive}
+
+                lvconvert \
+                  --type cache-pool \
+                  --cachemode writethrough \
+                  --poolmetadata ${config.name}/${lv.name}_cache_meta \
+                  ${config.name}/${lv.name}_cache
+
+                lvconvert \
+                  --type cache \
+                  --cachepool ${config.name}/${lv.name}_cache \
+                  ${config.name}/${lv.name}
+              ''
+            )}
           '') sortedLvs}
 
           ${lib.concatMapStrings (lv: ''
@@ -197,7 +271,9 @@ in
               ++ lib.optional (
                 lv.lvm_type == "raid4" || lv.lvm_type == "raid5" || lv.lvm_type == "raid6"
               ) "raid456";
-
+          })
+          (lib.optional (lv.caching != null) {
+            boot.initrd.kernelModules = ["dm-cache"];
           })
         ]) (lib.attrValues config.lvs);
       description = "NixOS configuration";
